@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 import type { ClipInfo, ProcessingStep } from '@/components/process-progress';
 import { ProcessProgress } from '@/components/process-progress';
 import { ClipsResult } from '@/components/clips-result';
+import { HealthCheckBar } from '@/components/health-check';
 
 type AppPhase = 'idle' | 'processing' | 'done' | 'error';
 type InputMode = 'url' | 'upload';
@@ -333,6 +334,7 @@ export default function AppClient() {
       </main>
 
       <footer className="relative border-t border-zinc-800/50 mt-auto">
+        <HealthCheckBar />
         <div className="px-4 py-4 text-center">
           <p className="text-xs text-zinc-500">Powered by Z.ai — AI Video Clipper & Subtitler</p>
         </div>

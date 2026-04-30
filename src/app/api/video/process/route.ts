@@ -246,7 +246,7 @@ Respond with valid JSON only (no markdown, no code blocks):
 If the video is very short (under 60 seconds), just return 1-2 segments covering the most important parts.`
             },
           ],
-          thinking: { type: 'enabled' },
+          thinking: { type: 'disabled' },
         });
 
         const llmContent = llmResponse.choices[0]?.message?.content || '';
