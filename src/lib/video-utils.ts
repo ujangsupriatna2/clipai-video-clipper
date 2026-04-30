@@ -66,12 +66,20 @@ export async function downloadYouTubeVideo(
   let duration = 0;
 
   try {
-    const infoCmd = `${YT_DLP} --print title --print duration --no-download "${url}"`;
-    const infoOutput = execSync(infoCmd, {
-      encoding: 'utf-8',
+    const infoCmd = [
+      YT_DLP,
+      '--remote-components', 'ejs:github',
+      '--js-runtimes', 'node',
+      '--print', 'title',
+      '--print', 'duration',
+      '--no-download',
+      '--no-playlist',
+      url,
+    ].join(' ');
+    const { stdout } = await execAsync(infoCmd, {
       timeout: 30000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim().split('\n');
+    });
+    const infoOutput = stdout.trim().split('\n');
 
     if (infoOutput.length >= 1) title = infoOutput[0].trim();
     if (infoOutput.length >= 2) duration = parseFloat(infoOutput[1].trim()) || 0;
@@ -84,11 +92,12 @@ export async function downloadYouTubeVideo(
     throw new Error(`Video is too long (${Math.floor(duration / 60)} minutes). Maximum 10 minutes allowed.`);
   }
 
-  // Download the video - best quality, mp4 format, max 720p for faster processing
+  // Download the video - best quality mp4, max 720p for faster processing
   const downloadCmd = [
     YT_DLP,
-    '-f', 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-    '--merge-output-format', 'mp4',
+    '--remote-components', 'ejs:github',
+    '--js-runtimes', 'node',
+    '-f', 'best[height<=720][ext=mp4]/best[height<=720]/best',
     '--max-filesize', '200M',
     '-o', outputPath,
     '--no-playlist',
@@ -98,13 +107,11 @@ export async function downloadYouTubeVideo(
   ].join(' ');
 
   try {
-    execSync(downloadCmd, {
-      encoding: 'utf-8',
+    await execAsync(downloadCmd, {
       timeout: 300000, // 5 min timeout
-      stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 50 * 1024 * 1024,
     });
-  } catch (err: unknown) {
+  } catch {
     // yt-dlp might still succeed even with stderr output
     if (!fs.existsSync(outputPath)) {
       throw new Error(
