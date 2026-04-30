@@ -307,80 +307,84 @@ export async function downloadYouTubeVideo(
   const outputPath = path.join(outputDir, 'yt_video.%(ext)s');
   let title = 'YouTube Video', duration = 0;
 
-  // Get video info
-  try {
-    const info = await spawnYtDlp([
-      '--no-download', '--print', '%(title)s', '--print', '%(duration)s',
-      '--no-playlist', url,
-    ], 30000);
-    const lines = info.stdout.trim().split('\n').filter(Boolean);
-    if (lines.length >= 1) title = lines[0].trim();
-    if (lines.length >= 2) duration = parseFloat(lines[1].trim()) || 0;
-    console.log(`[yt-dlp] Info: "${title}" ${duration}s`);
-    if (info.stderr) console.log(`[yt-dlp] Info stderr: ${info.stderr.slice(-300)}`);
-  } catch (err) {
-    console.warn('[yt-dlp] Info fetch failed:', err);
+  // Get video info — also try different player clients for info
+  const playerClients = ['android', 'ios', 'tv', 'web'];
+
+  for (const client of playerClients) {
+    try {
+      const args = ['--no-download', '--print', '%(title)s', '--print', '%(duration)s', '--no-playlist', '--extractor-args', `youtube:player_client=${client}`, url];
+      const info = await spawnYtDlp(args, 30000);
+      if (info.code === 0 && info.stdout.trim()) {
+        const lines = info.stdout.trim().split('\n').filter(Boolean);
+        if (lines.length >= 1) title = lines[0].trim();
+        if (lines.length >= 2) duration = parseFloat(lines[1].trim()) || 0;
+        console.log(`[yt-dlp] Info OK (client=${client}): "${title}" ${duration}s`);
+        break;
+      }
+    } catch {}
   }
 
   if (duration > 600) throw new Error(`Video too long (${Math.floor(duration / 60)}min). Max 10 min.`);
 
-  // Download — try multiple format strategies
+  // Download — try player clients × format strategies
+  // player_client bypasses the "sign in to confirm" / cookies requirement
   const formatStrategies = [
-    // Strategy 1: best single file <=720p
     { f: 'best[height<=720][ext=mp4]/best[height<=720]/best', label: 'best<=720p' },
-    // Strategy 2: any best single file
     { f: 'best[ext=mp4]/best', label: 'best-any' },
-    // Strategy 3: worst quality (smallest, most likely to succeed)
     { f: 'worst', label: 'worst' },
   ];
 
   let lastStderr = '';
   let lastCode = -1;
 
-  for (const strategy of formatStrategies) {
-    console.log(`[yt-dlp] Trying format: ${strategy.f}`);
+  for (const client of playerClients) {
+    for (const strategy of formatStrategies) {
+      console.log(`[yt-dlp] client=${client} format=${strategy.f}`);
 
-    const dl = await spawnYtDlp([
-      '-f', strategy.f,
-      '--max-filesize', '200M',
-      '-o', outputPath,
-      '--no-playlist',
-      '--newline',
-      url,
-    ], 300000);
+      const dl = await spawnYtDlp([
+        '-f', strategy.f,
+        '--extractor-args', `youtube:player_client=${client}`,
+        '--max-filesize', '200M',
+        '-o', outputPath,
+        '--no-playlist',
+        '--newline',
+        url,
+      ], 300000);
 
-    lastStderr = dl.stderr;
-    lastCode = dl.code;
+      lastStderr = dl.stderr;
+      lastCode = dl.code;
 
-    console.log(`[yt-dlp] Exit code: ${dl.code}`);
-    if (dl.stderr) console.log(`[yt-dlp] stderr: ${dl.stderr.slice(-500)}`);
+      // Check if file was downloaded
+      const files = fs.readdirSync(outputDir).filter(f =>
+        f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
+      );
 
-    // Check if file was downloaded
-    const files = fs.readdirSync(outputDir).filter(f =>
-      f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
-    );
-
-    if (files.length > 0) {
-      const vp = path.join(outputDir, files[0]);
-      const fileSize = fs.statSync(vp).size;
-      if (fileSize > 1000) {
-        console.log(`[yt-dlp] Success: ${files[0]} (${(fileSize / 1024 / 1024).toFixed(1)}MB) format=${strategy.label}`);
-        return { videoPath: vp, title, duration: getVideoDuration(vp) };
+      if (files.length > 0) {
+        const vp = path.join(outputDir, files[0]);
+        const fileSize = fs.statSync(vp).size;
+        if (fileSize > 1000) {
+          console.log(`[yt-dlp] Success: ${files[0]} (${(fileSize / 1024 / 1024).toFixed(1)}MB) client=${client} format=${strategy.label}`);
+          return { videoPath: vp, title, duration: getVideoDuration(vp) };
+        }
+        try { fs.unlinkSync(vp); } catch {}
       }
-      // File too small, try next
-      fs.unlinkSync(vp);
+
+      // If exit code is not about format/player, skip remaining formats for this client
+      if (dl.code !== 0 && !dl.stderr.includes('Requested format is not available') && !dl.stderr.includes('format not available')) {
+        console.log(`[yt-dlp] Client ${client} failed with non-format error, trying next client`);
+        break; // skip to next player client
+      }
     }
   }
 
-  // All strategies failed — show detailed error
+  // All strategies failed
   const stderrSummary = lastStderr.slice(-300).replace(/\n/g, ' ').trim();
   console.error(`[yt-dlp] All strategies failed. Last stderr: ${stderrSummary}`);
-  console.error(`[yt-dlp] Dir contents:`, fs.readdirSync(outputDir));
 
   throw new Error(
     `Failed to download video. ` +
-    (lastCode !== 0 ? `Exit code ${lastCode}. ` : '') +
-    (stderrSummary ? `Reason: ${stderrSummary}` : 'The video may be private, age-restricted, or the URL may be invalid.')
+    (lastCode !== 0 ? `(exit ${lastCode}) ` : '') +
+    (stderrSummary ? stderrSummary : 'Video may be private, age-restricted, or URL invalid. Try a different video.')
   );
 }
 
