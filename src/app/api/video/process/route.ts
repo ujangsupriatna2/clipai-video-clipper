@@ -6,6 +6,7 @@ import ZAI from 'z-ai-web-dev-sdk';
 import {
   getVideoDuration,
   extractAudio,
+  splitAudio,
   cutVideo,
   generateSRT,
   burnSubtitles,
@@ -14,6 +15,10 @@ import {
 
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
 const OUTPUTS_DIR = path.join(process.cwd(), 'outputs');
+
+// Ensure directories exist on module load
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 
 export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
@@ -132,24 +137,52 @@ export async function POST(req: NextRequest) {
           progress: 35,
         });
 
-        // Step 3: Transcribe audio
+        // Step 3: Transcribe audio (split into 28s chunks if needed)
         send({
           step: 'transcribing',
           message: 'AI is listening and converting speech to text...',
-          progress: 40,
+          progress: 35,
         });
 
         const zai = await ZAI.create();
-        const audioBuffer = fs.readFileSync(audioPath);
-        const base64Audio = audioBuffer.toString('base64');
 
-        const asrResponse = await zai.audio.asr.create({
-          file_base64: base64Audio,
-        });
+        // Split audio into chunks (API limit is 30s)
+        const audioChunks = splitAudio(audioPath, uploadDir, 28);
+        const transcriptParts: string[] = [];
 
-        const transcript = asrResponse.text || '';
+        for (let i = 0; i < audioChunks.length; i++) {
+          const chunkProgress = 35 + ((i + 1) / audioChunks.length) * 20;
+          send({
+            step: 'transcribing',
+            message: audioChunks.length > 1
+              ? `Transcribing part ${i + 1} of ${audioChunks.length}...`
+              : 'AI is listening and converting speech to text...',
+            progress: chunkProgress,
+          });
 
-        if (!transcript.trim()) {
+          const chunkBuffer = fs.readFileSync(audioChunks[i]);
+          const base64Chunk = chunkBuffer.toString('base64');
+
+          try {
+            const asrResponse = await zai.audio.asr.create({
+              file_base64: base64Chunk,
+            });
+            const partText = (asrResponse.text || '').trim();
+            if (partText) transcriptParts.push(partText);
+          } catch (asrErr) {
+            console.error(`[ASR] Chunk ${i + 1} failed:`, asrErr);
+            // Continue with other chunks even if one fails
+          }
+
+          // Clean up chunk file (if it was a split chunk, not the original)
+          if (audioChunks[i] !== audioPath) {
+            try { fs.unlinkSync(audioChunks[i]); } catch {}
+          }
+        }
+
+        const transcript = transcriptParts.join(' ').trim();
+
+        if (!transcript) {
           send({
             step: 'error',
             message: 'No speech detected in the video.',
