@@ -293,57 +293,257 @@ function spawnYtDlp(args: string[], timeout: number = 300000): Promise<{ stdout:
   });
 }
 
+// ============================================
+// YouTube video ID extraction
+// ============================================
+
+function extractVideoId(url: string): string | null {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// ============================================
+// Piped/Invidious API download (no cookies needed)
+// ============================================
+
+interface PipedStream {
+  url: string;
+  format?: string;
+  quality?: string;
+  mimeType?: string;
+  videoOnly?: boolean;
+  height?: number;
+}
+
+interface InvidiousStream {
+  url: string;
+  format?: string;
+  qualityLabel?: string;
+  type?: string;
+  container?: string;
+  videoOnly?: boolean;
+}
+
+async function downloadViaProxyAPI(
+  videoId: string,
+  outputDir: string,
+  onProgress?: (percent: number) => void
+): Promise<{ videoPath: string; title: string; duration: number } | null> {
+  const outputPath = path.join(outputDir, 'yt_video.mp4');
+
+  // --- Try Piped API instances ---
+  const pipedInstances = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://watchapi.whatever.social',
+  ];
+
+  for (const instance of pipedInstances) {
+    try {
+      console.log(`[piped] Trying ${instance}...`);
+      const res = await fetch(`${instance}/streams/${videoId}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      const title = data.title || 'YouTube Video';
+      const duration = Math.floor(data.duration || 0);
+
+      if (duration > 600) continue;
+
+      // Find combined (video+audio) mp4 stream, prefer <=720p
+      const streams: PipedStream[] = data.videoStreams || [];
+      const combined = streams
+        .filter(s => !s.videoOnly && s.mimeType?.includes('video/mp4'))
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+      const stream = combined.find(s => (s.height || 999) <= 720) || combined[0];
+
+      if (!stream?.url) {
+        console.log('[piped] No suitable combined stream found');
+        continue;
+      }
+
+      console.log(`[piped] Downloading from ${instance}: ${stream.quality || stream.height + 'p'} (${title})`);
+      const ok = await downloadStreamToFileSync(stream.url, outputPath, onProgress);
+      if (ok && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
+        console.log(`[piped] Success: ${(fs.statSync(outputPath).size / 1024 / 1024).toFixed(1)}MB`);
+        return { videoPath: outputPath, title, duration };
+      }
+    } catch (err) {
+      console.log(`[piped] ${instance} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  // --- Try Invidious API instances ---
+  const invidiousInstances = [
+    'https://inv.nadeko.net',
+    'https://invidious.nerdvpn.de',
+    'https://yt.drgnz.club',
+  ];
+
+  for (const instance of invidiousInstances) {
+    try {
+      console.log(`[invidious] Trying ${instance}...`);
+      const res = await fetch(
+        `${instance}/api/v1/videos/${videoId}?fields=title,lengthSeconds,formatStreams,adaptiveFormats`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(15000) }
+      );
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      const title = data.title || 'YouTube Video';
+      const duration = data.lengthSeconds || 0;
+
+      if (duration > 600) continue;
+
+      // formatStreams = combined video+audio
+      const streams: InvidiousStream[] = data.formatStreams || [];
+      const sorted = streams
+        .filter(s => s.type?.includes('video/mp4'))
+        .sort((a, b) => {
+          const qa = parseInt(a.qualityLabel || '0') || 0;
+          const qb = parseInt(b.qualityLabel || '0') || 0;
+          return qb - qa;
+        });
+
+      const stream = sorted.find(s => {
+        const q = parseInt(s.qualityLabel || '0') || 0;
+        return q <= 720;
+      }) || sorted[0];
+
+      if (!stream?.url) {
+        console.log('[invidious] No suitable stream found');
+        continue;
+      }
+
+      // Invidious URLs need to be proxied
+      let videoUrl = stream.url;
+      if (videoUrl.startsWith('/')) videoUrl = `${instance}${videoUrl}`;
+
+      console.log(`[invidious] Downloading from ${instance}: ${stream.qualityLabel || '?'}p (${title})`);
+      const ok = await downloadStreamToFileSync(videoUrl, outputPath, onProgress);
+      if (ok && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
+        console.log(`[invidious] Success: ${(fs.statSync(outputPath).size / 1024 / 1024).toFixed(1)}MB`);
+        return { videoPath: outputPath, title, duration };
+      }
+    } catch (err) {
+      console.log(`[invidious] ${instance} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Download a URL to a file using Node.js fetch (no curl/python needed)
+ */
+async function downloadStreamToFileSync(
+  url: string,
+  outputPath: string,
+  onProgress?: (percent: number) => void
+): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      signal: AbortSignal.timeout(300000),
+      redirect: 'follow',
+    });
+
+    if (!res.ok || !res.body) {
+      console.log(`[download] HTTP ${res.status} ${res.statusText}`);
+      return false;
+    }
+
+    const totalSize = parseInt(res.headers.get('content-length') || '0');
+    let downloaded = 0;
+
+    const fileStream = fs.createWriteStream(outputPath);
+    const reader = res.body.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      fileStream.write(value);
+      downloaded += value.length;
+      if (totalSize > 0 && onProgress) {
+        onProgress(Math.round((downloaded / totalSize) * 100));
+      }
+    }
+
+    fileStream.end();
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('finish', resolve);
+      fileStream.on('error', reject);
+    });
+
+    // Check size limit
+    if (totalSize > 200 * 1024 * 1024) {
+      fs.unlinkSync(outputPath);
+      console.log('[download] File too large');
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.log('[download] Failed:', err instanceof Error ? err.message : err);
+    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+    return false;
+  }
+}
+
+// ============================================
+// Main YouTube download function
+// ============================================
+
 export async function downloadYouTubeVideo(
   url: string, outputDir: string, onProgress?: (percent: number) => void
 ): Promise<{ videoPath: string; title: string; duration: number }> {
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const videoId = extractVideoId(url);
+  if (!videoId) throw new Error('Invalid YouTube URL. Please provide a valid YouTube link.');
+
+  console.log(`[yt] Video ID: ${videoId}, URL: ${url}`);
+
+  // ── Strategy 1: Piped/Invidious API (no cookies, no yt-dlp needed) ──
+  console.log('[yt] Trying proxy API (Piped/Invidious)...');
+  const proxyResult = await downloadViaProxyAPI(videoId, outputDir, onProgress);
+  if (proxyResult) {
+    // Get actual duration with ffprobe
+    try {
+      proxyResult.duration = getVideoDuration(proxyResult.videoPath);
+    } catch {}
+    return proxyResult;
+  }
+
+  // ── Strategy 2: yt-dlp with player_client fallback ──
   let ytDlp: string;
   try { ytDlp = getYtDlpPath(); }
-  catch { throw new Error('YouTube download is not available. Please upload a video file instead.'); }
+  catch { throw new Error('All download methods failed. Please upload a video file instead.'); }
 
-  fs.mkdirSync(outputDir, { recursive: true });
-  console.log(`[yt-dlp] Binary: ${ytDlp}`);
-  console.log(`[yt-dlp] Downloading: ${url}`);
-
+  console.log('[yt] Trying yt-dlp...');
   const outputPath = path.join(outputDir, 'yt_video.%(ext)s');
   let title = 'YouTube Video', duration = 0;
 
-  // Get video info — also try different player clients for info
-  const playerClients = ['android', 'ios', 'tv', 'web'];
-
-  for (const client of playerClients) {
-    try {
-      const args = ['--no-download', '--print', '%(title)s', '--print', '%(duration)s', '--no-playlist', '--extractor-args', `youtube:player_client=${client}`, url];
-      const info = await spawnYtDlp(args, 30000);
-      if (info.code === 0 && info.stdout.trim()) {
-        const lines = info.stdout.trim().split('\n').filter(Boolean);
-        if (lines.length >= 1) title = lines[0].trim();
-        if (lines.length >= 2) duration = parseFloat(lines[1].trim()) || 0;
-        console.log(`[yt-dlp] Info OK (client=${client}): "${title}" ${duration}s`);
-        break;
-      }
-    } catch {}
-  }
-
-  if (duration > 600) throw new Error(`Video too long (${Math.floor(duration / 60)}min). Max 10 min.`);
-
-  // Download — try player clients × format strategies
-  // player_client bypasses the "sign in to confirm" / cookies requirement
   const formatStrategies = [
     { f: 'best[height<=720][ext=mp4]/best[height<=720]/best', label: 'best<=720p' },
     { f: 'best[ext=mp4]/best', label: 'best-any' },
     { f: 'worst', label: 'worst' },
   ];
 
-  let lastStderr = '';
-  let lastCode = -1;
-
-  for (const client of playerClients) {
-    for (const strategy of formatStrategies) {
-      console.log(`[yt-dlp] client=${client} format=${strategy.f}`);
-
+  for (const strategy of formatStrategies) {
+    try {
       const dl = await spawnYtDlp([
         '-f', strategy.f,
-        '--extractor-args', `youtube:player_client=${client}`,
         '--max-filesize', '200M',
         '-o', outputPath,
         '--no-playlist',
@@ -351,40 +551,27 @@ export async function downloadYouTubeVideo(
         url,
       ], 300000);
 
-      lastStderr = dl.stderr;
-      lastCode = dl.code;
-
-      // Check if file was downloaded
       const files = fs.readdirSync(outputDir).filter(f =>
         f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
       );
 
       if (files.length > 0) {
         const vp = path.join(outputDir, files[0]);
-        const fileSize = fs.statSync(vp).size;
-        if (fileSize > 1000) {
-          console.log(`[yt-dlp] Success: ${files[0]} (${(fileSize / 1024 / 1024).toFixed(1)}MB) client=${client} format=${strategy.label}`);
+        if (fs.statSync(vp).size > 1000) {
           return { videoPath: vp, title, duration: getVideoDuration(vp) };
         }
         try { fs.unlinkSync(vp); } catch {}
       }
 
-      // If exit code is not about format/player, skip remaining formats for this client
-      if (dl.code !== 0 && !dl.stderr.includes('Requested format is not available') && !dl.stderr.includes('format not available')) {
-        console.log(`[yt-dlp] Client ${client} failed with non-format error, trying next client`);
-        break; // skip to next player client
-      }
-    }
+      // If non-format error, don't bother trying more formats
+      if (dl.code !== 0 && !dl.stderr.includes('format is not available')) break;
+    } catch {}
   }
 
-  // All strategies failed
-  const stderrSummary = lastStderr.slice(-300).replace(/\n/g, ' ').trim();
-  console.error(`[yt-dlp] All strategies failed. Last stderr: ${stderrSummary}`);
-
   throw new Error(
-    `Failed to download video. ` +
-    (lastCode !== 0 ? `(exit ${lastCode}) ` : '') +
-    (stderrSummary ? stderrSummary : 'Video may be private, age-restricted, or URL invalid. Try a different video.')
+    'Failed to download video from YouTube. ' +
+    'The video may be private, age-restricted, or requires sign-in. ' +
+    'Try a different public video, or upload a file directly.'
   );
 }
 
