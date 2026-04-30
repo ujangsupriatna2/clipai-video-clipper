@@ -58,3 +58,6 @@ server.log
 /db/*.db
 /dev.log
 /keepalive.sh
+bin/ffmpeg
+bin/ffprobe
+bin/yt-dlp

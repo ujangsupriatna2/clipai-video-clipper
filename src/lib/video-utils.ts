@@ -2,57 +2,72 @@ import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-const FFMPEG = 'ffmpeg';
-const FFPROBE = 'ffprobe';
+// ============================================
+// Binary path resolution
+// ============================================
 
 /**
- * Find yt-dlp binary path
- * Checks: bundled bin/, venv, local, system PATH
+ * Find a binary across multiple locations:
+ * 1. Bundled in bin/ (for deployed env)
+ * 2. System PATH
  */
-function findYtDlp(): string | null {
-  const candidates = [
-    // Bundled with the app (for deployed environment)
-    path.join(process.cwd(), 'bin', 'yt-dlp'),
-    // Dev environment paths
-    '/home/z/.venv/bin/yt-dlp',
-    '/home/z/.local/bin/yt-dlp',
-    '/usr/local/bin/yt-dlp',
-    '/usr/bin/yt-dlp',
-  ];
-
-  for (const candidate of candidates) {
+function findBinary(name: string): string {
+  // Bundled binary (deployed env)
+  const bundled = path.join(process.cwd(), 'bin', name);
+  if (fs.existsSync(bundled)) {
     try {
-      if (fs.existsSync(candidate)) {
-        execSync(`"${candidate}" --version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' });
-        return candidate;
-      }
+      execSync(`"${bundled}" --version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' });
+      return bundled;
     } catch {}
   }
 
-  // Try system PATH
+  // System PATH
   try {
-    const result = execSync('which yt-dlp', { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).trim();
+    const result = execSync(`which ${name}`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).trim();
     if (result) return result;
   } catch {}
 
-  return null;
+  throw new Error(`Required binary "${name}" not found. Video processing is unavailable.`);
+}
+
+// Resolve paths once at module load
+let _ffmpeg: string;
+let _ffprobe: string;
+let _ytdlp: string;
+
+function getFFmpeg(): string {
+  if (!_ffmpeg) _ffmpeg = findBinary('ffmpeg');
+  return _ffmpeg;
+}
+
+function getFFprobe(): string {
+  if (!_ffprobe) _ffprobe = findBinary('ffprobe');
+  return _ffprobe;
 }
 
 function getYtDlpPath(): string {
-  const p = findYtDlp();
-  if (!p) {
-    throw new Error('YouTube download is not available. yt-dlp binary not found.');
+  if (!_ytdlp) {
+    try {
+      _ytdlp = findBinary('yt-dlp');
+    } catch {
+      throw new Error('YouTube download is not available on this server. Please upload a video file instead.');
+    }
   }
-  return p;
+  return _ytdlp;
 }
+
+// ============================================
+// Video utilities
+// ============================================
 
 /**
  * Get video duration in seconds using ffprobe
  */
 export function getVideoDuration(filePath: string): number {
   try {
+    const ffprobe = getFFprobe();
     const output = execSync(
-      `${FFPROBE} -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
+      `"${ffprobe}" -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
     if (!output || isNaN(parseFloat(output))) {
@@ -61,7 +76,7 @@ export function getVideoDuration(filePath: string): number {
     return parseFloat(output);
   } catch (err: unknown) {
     if (err instanceof Error && err.message.includes('Could not read')) throw err;
-    throw new Error('Invalid video file.');
+    throw new Error('Invalid video file. FFmpeg may not be available.');
   }
 }
 
@@ -148,11 +163,10 @@ export async function downloadYouTubeVideo(
     throw new Error(`Video is too long (${Math.floor(duration / 60)}min). Max 10 minutes.`);
   }
 
-  // Download
+  // Download — prefer single-file formats that don't need FFmpeg for merging
   console.log(`[yt-dlp] Starting download...`);
   const downloadResult = await spawnYtDlp([
-    '-f', 'best[height<=720][ext=mp4]/best[height<=720]/bestvideo+bestaudio/best',
-    '--merge-output-format', 'mp4',
+    '-f', 'best[height<=720][ext=mp4]/best[height<=720][ext=webm]/best[height<=720]/best',
     '--max-filesize', '200M',
     '-o', outputPath,
     '--no-playlist',
@@ -164,6 +178,9 @@ export async function downloadYouTubeVideo(
   ], 300000);
 
   console.log(`[yt-dlp] Exit code: ${downloadResult.code}`);
+  if (downloadResult.stderr) {
+    console.log(`[yt-dlp] stderr (last 300 chars):`, downloadResult.stderr.slice(-300));
+  }
 
   // Search for the downloaded file
   const possibleFiles = fs.readdirSync(outputDir).filter(f =>
@@ -215,9 +232,10 @@ export async function downloadYouTubeVideo(
  * Extract audio from video as WAV (16kHz mono)
  */
 export function extractAudio(videoPath: string, outputPath: string): void {
+  const ffmpeg = getFFmpeg();
   try {
     execSync(
-      `${FFMPEG} -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${outputPath}"`,
+      `"${ffmpeg}" -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${outputPath}"`,
       { stdio: ['pipe', 'pipe', 'pipe'] }
     );
   } catch {
@@ -229,9 +247,11 @@ export function extractAudio(videoPath: string, outputPath: string): void {
  * Split audio into chunks for ASR (30s max)
  */
 export function splitAudio(inputPath: string, outputDir: string, maxChunkDuration: number = 28): string[] {
+  const ffprobe = getFFprobe();
+  const ffmpeg = getFFmpeg();
   try {
     const duration = execSync(
-      `${FFPROBE} -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`,
+      `"${ffprobe}" -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
 
@@ -242,7 +262,7 @@ export function splitAudio(inputPath: string, outputDir: string, maxChunkDuratio
     for (let i = 0; i < numChunks; i++) {
       const chunkPath = path.join(outputDir, `chunk_${String(i).padStart(3, '0')}.wav`);
       execSync(
-        `${FFMPEG} -y -ss ${i * maxChunkDuration} -i "${inputPath}" -t ${maxChunkDuration} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`,
+        `"${ffmpeg}" -y -ss ${i * maxChunkDuration} -i "${inputPath}" -t ${maxChunkDuration} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`,
         { stdio: ['pipe', 'pipe', 'pipe'] }
       );
       chunks.push(chunkPath);
@@ -258,9 +278,10 @@ export function splitAudio(inputPath: string, outputDir: string, maxChunkDuratio
  * Cut a video segment
  */
 export function cutVideo(inputPath: string, outputPath: string, startTime: number, endTime: number): void {
+  const ffmpeg = getFFmpeg();
   try {
     execSync(
-      `${FFMPEG} -y -ss ${startTime} -i "${inputPath}" -t ${endTime - startTime} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
+      `"${ffmpeg}" -y -ss ${startTime} -i "${inputPath}" -t ${endTime - startTime} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
       { stdio: ['pipe', 'pipe', 'pipe'] }
     );
   } catch {
@@ -295,14 +316,16 @@ export function generateSRT(subtitleText: string, duration: number, outputPath: 
  * Burn subtitles into video
  */
 export function burnSubtitles(inputPath: string, srtPath: string, outputPath: string): void {
-  const escaped = srtPath.replace(/:/g, '\\:').replace(/\\/g, '\\\\');
+  const ffmpeg = getFFmpeg();
+  const escaped = srtPath.replace(/:/g, '\\:').replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
   try {
     execSync(
-      `${FFMPEG} -y -i "${inputPath}" -vf "subtitles='${escaped}':force_style='FontSize=20,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,BackColour=&H80000000&,Outline=2,Shadow=0,MarginV=30'" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
+      `"${ffmpeg}" -y -i "${inputPath}" -vf "subtitles='${escaped}':force_style='FontSize=20,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,BackColour=&H80000000&,Outline=2,Shadow=0,MarginV=30'" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
       { stdio: ['pipe', 'pipe', 'pipe'] }
     );
-  } catch {
-    execSync(`${FFMPEG} -y -i "${inputPath}" -c copy "${outputPath}"`, { stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch (subErr) {
+    console.warn('[ffmpeg] Subtitle burn failed, copying without subtitles:', subErr);
+    execSync(`"${ffmpeg}" -y -i "${inputPath}" -c copy "${outputPath}"`, { stdio: ['pipe', 'pipe', 'pipe'] });
   }
 }
 

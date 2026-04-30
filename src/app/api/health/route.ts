@@ -12,6 +12,21 @@ interface HealthCheckResult {
   details?: string;
 }
 
+function findBinary(name: string): string | null {
+  const bundled = path.join(process.cwd(), 'bin', name);
+  if (fs.existsSync(bundled)) {
+    try {
+      const ver = execSync(`"${bundled}" --version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' });
+      if (ver.trim()) return bundled;
+    } catch {}
+  }
+  try {
+    const result = execSync(`which ${name}`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).trim();
+    if (result) return result;
+  } catch {}
+  return null;
+}
+
 export async function GET() {
   const results: HealthCheckResult[] = [];
   const startTime = Date.now();
@@ -19,57 +34,44 @@ export async function GET() {
   // 1. Check FFmpeg
   try {
     const ffmpegStart = Date.now();
-    const version = execSync('ffmpeg -version 2>&1 | head -1', {
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).trim();
-    const ffprobeVersion = execSync('ffprobe -version 2>&1 | head -1', {
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).trim();
-    results.push({
-      service: 'FFmpeg',
-      status: 'ok',
-      message: 'FFmpeg & FFprobe available',
-      latency: Date.now() - ffmpegStart,
-      details: `${version} | ${ffprobeVersion}`,
-    });
+    const ffmpegPath = findBinary('ffmpeg');
+    const ffprobePath = findBinary('ffprobe');
+
+    if (ffmpegPath && ffprobePath) {
+      let ffmpegVer = '';
+      let ffprobeVer = '';
+      try {
+        ffmpegVer = execSync(`"${ffmpegPath}" -version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).split('\n')[0];
+      } catch {}
+      try {
+        ffprobeVer = execSync(`"${ffprobePath}" -version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).split('\n')[0];
+      } catch {}
+      results.push({
+        service: 'FFmpeg',
+        status: 'ok',
+        message: 'FFmpeg & FFprobe available',
+        latency: Date.now() - ffmpegStart,
+        details: `${ffmpegVer} | ${ffprobeVer}`,
+      });
+    } else {
+      results.push({
+        service: 'FFmpeg',
+        status: 'error',
+        message: `FFmpeg not found — video processing will fail (ffmpeg: ${ffmpegPath || 'MISSING'}, ffprobe: ${ffprobePath || 'MISSING'})`,
+      });
+    }
   } catch {
     results.push({
       service: 'FFmpeg',
       status: 'error',
-      message: 'FFmpeg not found — video processing will fail',
+      message: 'FFmpeg check failed — video processing will fail',
     });
   }
 
   // 2. Check yt-dlp
   try {
     const ytdlpStart = Date.now();
-    const candidates = [
-      path.join(process.cwd(), 'bin', 'yt-dlp'),
-      '/home/z/.venv/bin/yt-dlp',
-      '/home/z/.local/bin/yt-dlp',
-      '/usr/local/bin/yt-dlp',
-      '/usr/bin/yt-dlp',
-    ];
-
-    let ytDlpPath: string | null = null;
-    for (const candidate of candidates) {
-      try {
-        if (fs.existsSync(candidate)) {
-          execSync(`"${candidate}" --version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' });
-          ytDlpPath = candidate;
-          break;
-        }
-      } catch {}
-    }
-
-    if (!ytDlpPath) {
-      try {
-        const whichResult = execSync('which yt-dlp', { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' }).trim();
-        if (whichResult) ytDlpPath = whichResult;
-      } catch {}
-    }
+    const ytDlpPath = findBinary('yt-dlp');
 
     if (ytDlpPath) {
       const ytdlpVersion = execSync(`"${ytDlpPath}" --version`, {
@@ -102,19 +104,18 @@ export async function GET() {
     const asrStart = Date.now();
     const zai = await ZAI.create();
 
-    // Generate a tiny sine wave WAV (1 second of silence) to test ASR connectivity
+    // Generate a tiny WAV (1 second of silence) to test ASR connectivity
     const sampleRate = 16000;
     const numSamples = sampleRate * 1;
     const buffer = Buffer.alloc(44 + numSamples * 2);
 
-    // WAV header
     buffer.write('RIFF', 0);
     buffer.writeUInt32LE(36 + numSamples * 2, 4);
     buffer.write('WAVE', 8);
     buffer.write('fmt ', 12);
     buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20); // PCM
-    buffer.writeUInt16LE(1, 22); // mono
+    buffer.writeUInt16LE(1, 20);
+    buffer.writeUInt16LE(1, 22);
     buffer.writeUInt32LE(sampleRate, 24);
     buffer.writeUInt32LE(sampleRate * 2, 28);
     buffer.writeUInt16LE(2, 32);
@@ -123,13 +124,9 @@ export async function GET() {
     buffer.writeUInt32LE(numSamples * 2, 40);
 
     const base64Audio = buffer.toString('base64');
-
-    const asrResponse = await zai.audio.asr.create({
-      file_base64: base64Audio,
-    });
+    await zai.audio.asr.create({ file_base64: base64Audio });
 
     const latency = Date.now() - asrStart;
-
     results.push({
       service: 'ASR (Speech-to-Text)',
       status: 'ok',
@@ -188,7 +185,6 @@ export async function GET() {
   try {
     const uploadsDir = path.join(process.cwd(), 'uploads');
     const outputsDir = path.join(process.cwd(), 'outputs');
-
     if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
     if (!fs.existsSync(outputsDir)) fs.mkdirSync(outputsDir, { recursive: true });
 
