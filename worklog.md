@@ -1,25 +1,25 @@
 ---
-Task ID: 4
+Task ID: 5
 Agent: Main
-Task: Fix YouTube download + audio chunking for ASR API limit
+Task: Fix YouTube download for deployed environment (no yt-dlp binary)
 
 Work Log:
-- Fixed yt-dlp download "file not found" error:
-  - Changed from execAsync (shell-based) to spawn (direct process) to avoid shell escaping issues
-  - Dynamic yt-dlp binary detection: checks /home/z/.venv/bin, /home/z/.local/bin, /usr/local/bin, /usr/bin, and `which`
-  - Changed output template from `yt_video.mp4` to `yt_video.%(ext)s` to handle any format
-  - Added fallback search for any video file in output dir if expected name doesn't match
-  - Better error logging (exit code, stderr, dir contents)
-- Fixed ASR API 30-second limit:
-  - Added splitAudio() function to split audio into 28s chunks via FFmpeg
-  - Process route now transcribes each chunk separately
-  - Chunks are transcribed in sequence with progress updates
-  - Results are combined into full transcript
-  - Individual chunk failures don't stop the whole process
-- Fixed next.config.ts: changed allowedDevOrigins from regex to string
-- Pushed fix to GitHub: https://github.com/ujangsupriatna2/clipai-video-clipper
+- User deployed app but got "YouTube download is not available" because deployed Docker container has no yt-dlp
+- Tried multiple approaches:
+  - ytdl-core v4: hasVideo/hasAudio not set, combined format detection broken
+  - @distube/ytdl-core: decipher function parse failure, URLs missing
+  - play-dl: YouTubeVideo class crashes, stream_from_info fails
+  - youtubei.js + vm2: cipher not decrypted properly
+- Final solution: bundle yt-dlp binary with the app
+  - Created setup-ytdlp.sh: downloads yt-dlp from GitHub releases during build
+  - Modified package.json build script to run setup-ytdlp.sh and copy bin/ to standalone
+  - video-utils.ts now checks bin/yt-dlp first, then fallback paths
+  - Creates uploads/ and outputs/ directories at build time
+- Removed all experimental JS-only YouTube libraries
+- Pushed to GitHub
 
 Stage Summary:
-- YouTube download now works reliably (tested: Rick Astley video downloads and extracts audio)
-- Audio chunking supports videos of any length (split into 28s chunks for ASR API)
-- Committed and pushed: user needs to redeploy to get the fixes
+- yt-dlp binary is now bundled with the deployed app
+- Build process automatically downloads the latest yt-dlp
+- YouTube download should work in deployed environment
+- User needs to redeploy (Publish & Deploy) to get the fix
