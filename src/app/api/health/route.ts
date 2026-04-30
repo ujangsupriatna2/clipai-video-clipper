@@ -39,9 +39,9 @@ export async function GET() {
     let ffmpegPath = findBinary('ffmpeg');
     let ffprobePath = findBinary('ffprobe');
 
-    // If not found, try runtime download
+    // If not found, trigger runtime download
     if (!ffmpegPath || !ffprobePath) {
-      console.log('[health] FFmpeg not found, attempting auto-download...');
+      console.log('[health] FFmpeg not found, triggering auto-download...');
       const downloaded = await ensureFFmpeg();
       if (downloaded) {
         ffmpegPath = findBinary('ffmpeg');
@@ -66,19 +66,16 @@ export async function GET() {
         details: `${ffmpegVer} | ${ffprobeVer}`,
       });
     } else {
-      // Read setup log for diagnostics
-      let setupLog = '';
-      const logPath = path.join(process.cwd(), 'bin', 'setup.log');
-      if (fs.existsSync(logPath)) {
-        try {
-          setupLog = fs.readFileSync(logPath, 'utf-8').slice(-500);
-        } catch {}
-      }
+      // Check what went wrong for diagnostics
+      let diagnostics = 'Download attempted but failed. ';
+      diagnostics += `python3: ${findBinary('python3') ? 'available' : 'missing'} | `;
+      diagnostics += `curl: ${findBinary('curl') ? 'available' : 'missing'} | `;
+      diagnostics += `apt-get: ${findBinary('apt-get') ? 'available' : 'missing'}`;
       results.push({
         service: 'FFmpeg',
         status: 'error',
-        message: `FFmpeg not found — auto-download failed. Video processing unavailable.`,
-        details: setupLog ? `Setup log (last 500 chars): ${setupLog}` : 'No setup log found.',
+        message: 'FFmpeg not found — auto-download failed. Video processing unavailable.',
+        details: diagnostics,
       });
     }
   } catch {

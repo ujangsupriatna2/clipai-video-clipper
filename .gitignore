@@ -58,5 +58,7 @@ server.log
 /db/*.db
 /dev.log
 /keepalive.sh
-# bin/ binaries are committed for deployment reliability
-# (ffmpeg, ffprobe, yt-dlp)
+# bin/ - yt-dlp is committed (35MB, works), but ffmpeg/ffprobe are too large
+# FFmpeg is downloaded at runtime via ensureFFmpeg() using Python tarfile
+bin/ffmpeg
+bin/ffprobe

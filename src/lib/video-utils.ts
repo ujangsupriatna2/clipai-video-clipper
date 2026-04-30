@@ -1,4 +1,4 @@
-import { execSync, spawn, exec } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -13,7 +13,7 @@ let _ytdlp: string | null = null;
 
 /**
  * Find a binary across multiple locations:
- * 1. Bundled in bin/ (pre-committed or from build script)
+ * 1. Bundled in bin/ (for deployed env)
  * 2. System PATH
  */
 function findBinary(name: string): string {
@@ -57,25 +57,35 @@ function getYtDlpPath(): string {
 }
 
 /**
- * Ensure xz extraction support is available
+ * Extract a tar.xz archive using multiple methods
  */
-async function ensureXzSupport(): Promise<boolean> {
+function extractTarXz(archivePath: string, destDir: string): boolean {
+  // Method 1: Python tarfile (handles xz natively, most reliable)
   try {
-    execSync('tar xJf - < /dev/null 2>/dev/null || (command -v xz > /dev/null)', { timeout: 3000, stdio: 'pipe' });
+    execSync(
+      `python3 -W ignore -c "import tarfile; t=tarfile.open('${archivePath}','r:xz'); t.extractall('${destDir}'); t.close()"`,
+      { encoding: 'utf-8', timeout: 120000, stdio: 'pipe' }
+    );
     return true;
-  } catch {
-    // Try installing xz
-    try {
-      execSync('apt-get install -y -qq xz-utils 2>/dev/null || yum install -y xz 2>/dev/null || apk add xz 2>/dev/null', { timeout: 30000, stdio: 'pipe' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  } catch {}
+
+  // Method 2: tar with xz flag
+  try {
+    execSync(`tar xf "${archivePath}" -C "${destDir}"`, { timeout: 120000, stdio: 'pipe' });
+    return true;
+  } catch {}
+
+  // Method 3: xz pipe
+  try {
+    execSync(`xz -dc "${archivePath}" | tar xf - -C "${destDir}"`, { timeout: 120000, stdio: 'pipe' });
+    return true;
+  } catch {}
+
+  return false;
 }
 
 /**
- * Download FFmpeg static binary at runtime (fallback if build-time failed)
+ * Download FFmpeg static binary at runtime
  */
 async function downloadFFmpeg(): Promise<boolean> {
   if (_downloading) return false;
@@ -88,8 +98,8 @@ async function downloadFFmpeg(): Promise<boolean> {
     {
       name: 'johnvansickle.com (~40MB)',
       url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
-      minSize: 1000000, // 1MB
-      extract: (tmpDir: string, archivePath: string): string[] | null => {
+      minSize: 1000000,
+      findBinaries: (tmpDir: string): string[] | null => {
         const dir = fs.readdirSync(tmpDir).find(f => f.includes('ffmpeg') && f.includes('static'));
         if (!dir) return null;
         const base = path.join(tmpDir, dir);
@@ -99,8 +109,8 @@ async function downloadFFmpeg(): Promise<boolean> {
     {
       name: 'BtbN GitHub (~134MB)',
       url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz',
-      minSize: 10000000, // 10MB
-      extract: (tmpDir: string, archivePath: string): string[] | null => {
+      minSize: 10000000,
+      findBinaries: (tmpDir: string): string[] | null => {
         const dir = fs.readdirSync(tmpDir).find(f => f.includes('linux64-gpl'));
         if (!dir) return null;
         const base = path.join(tmpDir, dir, 'bin');
@@ -108,8 +118,6 @@ async function downloadFFmpeg(): Promise<boolean> {
       },
     },
   ];
-
-  await ensureXzSupport();
 
   for (const source of sources) {
     try {
@@ -123,39 +131,35 @@ async function downloadFFmpeg(): Promise<boolean> {
           source.url, '-o', archivePath,
         ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
+        let stderr = '';
+        proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
         proc.on('close', (code) => {
           if (code === 0) resolve();
-          else reject(new Error(`curl exit ${code}`));
+          else reject(new Error(`curl exit ${code}: ${stderr.slice(-200)}`));
         });
         proc.on('error', reject);
       });
 
       const fileSize = fs.statSync(archivePath).size;
+      console.log(`[ffmpeg] Downloaded ${Math.round(fileSize / 1024 / 1024)}MB`);
+
       if (fileSize < source.minSize) {
-        console.warn(`[ffmpeg] Download too small from ${source.name}: ${fileSize} bytes`);
+        console.warn(`[ffmpeg] Too small: ${fileSize} bytes`);
         fs.rmSync(tmpDir, { recursive: true });
         continue;
       }
 
-      console.log(`[ffmpeg] Downloaded ${Math.round(fileSize / 1024 / 1024)}MB, extracting...`);
-
-      // Try tar extraction first, then fallback to xz pipe
-      try {
-        execSync(`tar xf "${archivePath}" -C "${tmpDir}"`, { timeout: 60000 });
-      } catch {
-        console.warn(`[ffmpeg] tar xf failed, trying xz pipe...`);
-        try {
-          execSync(`xz -dc "${archivePath}" | tar xf - -C "${tmpDir}"`, { timeout: 60000 });
-        } catch (xzErr) {
-          console.warn(`[ffmpeg] xz extraction also failed:`, xzErr);
-          fs.rmSync(tmpDir, { recursive: true });
-          continue;
-        }
+      // Extract using Python tarfile (handles xz natively)
+      console.log('[ffmpeg] Extracting...');
+      if (!extractTarXz(archivePath, tmpDir)) {
+        console.warn('[ffmpeg] Extraction failed');
+        fs.rmSync(tmpDir, { recursive: true });
+        continue;
       }
 
-      const binPaths = source.extract(tmpDir, archivePath);
+      const binPaths = source.findBinaries(tmpDir);
       if (!binPaths || !binPaths[0] || !fs.existsSync(binPaths[0])) {
-        console.warn(`[ffmpeg] Could not find binaries in archive from ${source.name}`);
+        console.warn('[ffmpeg] Binaries not found in archive');
         fs.rmSync(tmpDir, { recursive: true });
         continue;
       }
@@ -167,8 +171,10 @@ async function downloadFFmpeg(): Promise<boolean> {
       fs.chmodSync(path.join(binDir, 'ffmpeg'), 0o755);
       fs.chmodSync(path.join(binDir, 'ffprobe'), 0o755);
 
+      const ver = execSync(`"${path.join(binDir, 'ffmpeg')}" -version`, { encoding: 'utf-8', timeout: 5000, stdio: 'pipe' });
+      console.log(`[ffmpeg] Installed: ${ver.split('\n')[0]}`);
+
       fs.rmSync(tmpDir, { recursive: true });
-      console.log(`[ffmpeg] Successfully installed from ${source.name}`);
       _downloading = false;
       return true;
     } catch (err) {
@@ -188,7 +194,7 @@ export async function ensureFFmpeg(): Promise<boolean> {
     getFFmpeg();
     return true;
   } catch {
-    console.log('[ffmpeg] Not found, attempting runtime download...');
+    console.log('[ffmpeg] Not found, starting runtime download...');
     const ok = await downloadFFmpeg();
     if (ok) {
       _ffmpeg = null;
@@ -282,25 +288,18 @@ export async function downloadYouTubeVideo(
 
   const outputPath = path.join(outputDir, 'yt_video.%(ext)s');
 
-  // Get video info first
   let title = 'YouTube Video';
   let duration = 0;
 
   try {
     const infoResult = await spawnYtDlp([
-      '--no-download',
-      '--print', '%(title)s',
-      '--print', '%(duration)s',
-      '--no-playlist',
-      '--no-warnings',
-      '--ignore-errors',
-      url,
+      '--no-download', '--print', '%(title)s', '--print', '%(duration)s',
+      '--no-playlist', '--no-warnings', '--ignore-errors', url,
     ], 30000);
 
     const lines = infoResult.stdout.trim().split('\n').filter(Boolean);
     if (lines.length >= 1) title = lines[0].trim();
     if (lines.length >= 2) duration = parseFloat(lines[1].trim()) || 0;
-    console.log(`[yt-dlp] Info: "${title}", ${duration}s`);
   } catch (err) {
     console.warn('[yt-dlp] Info fetch failed:', err);
   }
@@ -309,26 +308,12 @@ export async function downloadYouTubeVideo(
     throw new Error(`Video is too long (${Math.floor(duration / 60)}min). Max 10 minutes.`);
   }
 
-  // Download — prefer single-file formats that don't need FFmpeg for merging
-  console.log(`[yt-dlp] Starting download...`);
   const downloadResult = await spawnYtDlp([
     '-f', 'best[height<=720][ext=mp4]/best[height<=720][ext=webm]/best[height<=720]/best',
-    '--max-filesize', '200M',
-    '-o', outputPath,
-    '--no-playlist',
-    '--newline',
-    '--no-warnings',
-    '--progress',
-    '--ignore-errors',
-    url,
+    '--max-filesize', '200M', '-o', outputPath,
+    '--no-playlist', '--newline', '--no-warnings', '--progress', '--ignore-errors', url,
   ], 300000);
 
-  console.log(`[yt-dlp] Exit code: ${downloadResult.code}`);
-  if (downloadResult.stderr) {
-    console.log(`[yt-dlp] stderr (last 300 chars):`, downloadResult.stderr.slice(-300));
-  }
-
-  // Search for the downloaded file
   const possibleFiles = fs.readdirSync(outputDir).filter(f =>
     f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
   );
@@ -337,40 +322,22 @@ export async function downloadYouTubeVideo(
     const anyFiles = fs.readdirSync(outputDir).filter(f =>
       /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
     );
-    if (!anyFiles.length) {
-      console.error(`[yt-dlp] No file found. Dir:`, fs.readdirSync(outputDir));
-      console.error(`[yt-dlp] stderr:`, downloadResult.stderr.slice(-500));
-      throw new Error('Failed to download video. It may be private, age-restricted, or unavailable.');
-    }
-
+    if (!anyFiles.length) throw new Error('Failed to download video.');
     const actualPath = path.join(outputDir, anyFiles[0]);
     if (fs.statSync(actualPath).size < 1000) {
       fs.unlinkSync(actualPath);
-      throw new Error('Downloaded file too small. Video may be unavailable.');
+      throw new Error('Downloaded file too small.');
     }
-
-    return {
-      videoPath: actualPath,
-      title,
-      duration: getVideoDuration(actualPath),
-    };
+    return { videoPath: actualPath, title, duration: getVideoDuration(actualPath) };
   }
 
   const videoPath = path.join(outputDir, possibleFiles[0]);
-  const fileSize = fs.statSync(videoPath).size;
-
-  if (fileSize < 1000) {
+  if (fs.statSync(videoPath).size < 1000) {
     fs.unlinkSync(videoPath);
     throw new Error('Downloaded file too small.');
   }
 
-  console.log(`[yt-dlp] Done: ${(fileSize / 1024 / 1024).toFixed(1)}MB`);
-
-  return {
-    videoPath,
-    title,
-    duration: getVideoDuration(videoPath),
-  };
+  return { videoPath, title, duration: getVideoDuration(videoPath) };
 }
 
 /**
