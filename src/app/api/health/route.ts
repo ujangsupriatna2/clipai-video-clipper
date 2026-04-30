@@ -3,6 +3,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import ZAI from 'z-ai-web-dev-sdk';
+import { ensureFFmpeg } from '@/lib/video-utils';
 
 interface HealthCheckResult {
   service: string;
@@ -31,11 +32,23 @@ export async function GET() {
   const results: HealthCheckResult[] = [];
   const startTime = Date.now();
 
-  // 1. Check FFmpeg
+  // 1. Check FFmpeg (try auto-download if missing)
   try {
     const ffmpegStart = Date.now();
-    const ffmpegPath = findBinary('ffmpeg');
-    const ffprobePath = findBinary('ffprobe');
+
+    // First check if already available
+    let ffmpegPath = findBinary('ffmpeg');
+    let ffprobePath = findBinary('ffprobe');
+
+    // If not found, try runtime download
+    if (!ffmpegPath || !ffprobePath) {
+      console.log('[health] FFmpeg not found, attempting auto-download...');
+      const downloaded = await ensureFFmpeg();
+      if (downloaded) {
+        ffmpegPath = findBinary('ffmpeg');
+        ffprobePath = findBinary('ffprobe');
+      }
+    }
 
     if (ffmpegPath && ffprobePath) {
       let ffmpegVer = '';
@@ -57,7 +70,7 @@ export async function GET() {
       results.push({
         service: 'FFmpeg',
         status: 'error',
-        message: `FFmpeg not found — video processing will fail (ffmpeg: ${ffmpegPath || 'MISSING'}, ffprobe: ${ffprobePath || 'MISSING'})`,
+        message: `FFmpeg not found — auto-download failed. Video processing unavailable.`,
       });
     }
   } catch {

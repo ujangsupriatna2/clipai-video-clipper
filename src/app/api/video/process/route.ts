@@ -11,6 +11,7 @@ import {
   generateSRT,
   burnSubtitles,
   downloadYouTubeVideo,
+  ensureFFmpeg,
 } from '@/lib/video-utils';
 
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
@@ -110,6 +111,24 @@ export async function POST(req: NextRequest) {
           videoPath = path.join(uploadDir, `original${path.extname(videoFile.name) || '.mp4'}`);
           const videoBuffer = Buffer.from(await videoFile.arrayBuffer());
           fs.writeFileSync(videoPath, videoBuffer);
+        }
+
+        // Ensure FFmpeg is available (download at runtime if missing)
+        send({
+          step: 'uploading',
+          message: 'Checking video processing tools...',
+          progress: 15,
+        });
+
+        const ffmpegReady = await ensureFFmpeg();
+        if (!ffmpegReady) {
+          send({
+            step: 'error' as const,
+            message: 'FFmpeg is not available on this server.',
+            error: 'Video processing requires FFmpeg which is not installed. Please contact the administrator.',
+          });
+          controller.close();
+          return;
         }
 
         // Get video duration

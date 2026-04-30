@@ -1,10 +1,106 @@
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 // ============================================
-// Binary path resolution
+// Binary path resolution + runtime fallback
 // ============================================
+
+let _downloading = false;
+
+/**
+ * Download FFmpeg static binary at runtime (fallback if build-time download failed)
+ */
+async function downloadFFmpeg(): Promise<boolean> {
+  if (_downloading) return false;
+  _downloading = true;
+
+  const binDir = path.join(process.cwd(), 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+
+  const sources = [
+    {
+      name: 'johnvansickle.com',
+      url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
+      extract: (tmpDir: string) => {
+        const dir = fs.readdirSync(tmpDir).find(f => f.includes('ffmpeg') && f.includes('static'));
+        if (!dir) return null;
+        const base = path.join(tmpDir, dir);
+        return {
+          ffmpeg: path.join(base, 'ffmpeg'),
+          ffprobe: path.join(base, 'ffprobe'),
+        };
+      },
+    },
+    {
+      name: 'BtbN GitHub',
+      url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz',
+      extract: (tmpDir: string) => {
+        const dir = fs.readdirSync(tmpDir).find(f => f.includes('linux64-gpl'));
+        if (!dir) return null;
+        const base = path.join(tmpDir, dir, 'bin');
+        return {
+          ffmpeg: path.join(base, 'ffmpeg'),
+          ffprobe: path.join(base, 'ffprobe'),
+        };
+      },
+    },
+  ];
+
+  for (const source of sources) {
+    try {
+      console.log(`[ffmpeg] Downloading from ${source.name}...`);
+      const tmpDir = fs.mkdtempSync('/tmp/ffmpeg-XXXXXX');
+      const archivePath = path.join(tmpDir, 'ffmpeg.tar.xz');
+
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('curl', [
+          '-L', '--max-time', '300',
+          source.url, '-o', archivePath,
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`curl exit ${code}`));
+        });
+        proc.on('error', reject);
+      });
+
+      if (fs.statSync(archivePath).size < 1000000) {
+        console.warn(`[ffmpeg] Download too small from ${source.name}`);
+        fs.rmSync(tmpDir, { recursive: true });
+        continue;
+      }
+
+      // Extract
+      execSync(`tar xf "${archivePath}" -C "${tmpDir}"`, { timeout: 60000 });
+
+      const bins = source.extract(tmpDir);
+      if (!bins || !fs.existsSync(bins.ffmpeg)) {
+        console.warn(`[ffmpeg] Could not find binaries in archive from ${source.name}`);
+        fs.rmSync(tmpDir, { recursive: true });
+        continue;
+      }
+
+      fs.copyFileSync(bins.ffmpeg, path.join(binDir, 'ffmpeg'));
+      if (fs.existsSync(bins.ffprobe)) {
+        fs.copyFileSync(bins.ffprobe, path.join(binDir, 'ffprobe'));
+      }
+      fs.chmodSync(path.join(binDir, 'ffmpeg'), 0o755);
+      fs.chmodSync(path.join(binDir, 'ffprobe'), 0o755);
+
+      fs.rmSync(tmpDir, { recursive: true });
+      console.log(`[ffmpeg] Successfully installed from ${source.name}`);
+      _downloading = false;
+      return true;
+    } catch (err) {
+      console.warn(`[ffmpeg] Failed to download from ${source.name}:`, err);
+    }
+  }
+
+  _downloading = false;
+  return false;
+}
 
 /**
  * Find a binary across multiple locations:
@@ -30,10 +126,10 @@ function findBinary(name: string): string {
   throw new Error(`Required binary "${name}" not found. Video processing is unavailable.`);
 }
 
-// Resolve paths once at module load
-let _ffmpeg: string;
-let _ffprobe: string;
-let _ytdlp: string;
+// Resolve paths
+let _ffmpeg: string | null = null;
+let _ffprobe: string | null = null;
+let _ytdlp: string | null = null;
 
 function getFFmpeg(): string {
   if (!_ffmpeg) _ffmpeg = findBinary('ffmpeg');
@@ -56,6 +152,29 @@ function getYtDlpPath(): string {
   return _ytdlp;
 }
 
+/**
+ * Ensure FFmpeg is available. If not found, try downloading at runtime.
+ */
+export async function ensureFFmpeg(): Promise<boolean> {
+  try {
+    getFFmpeg();
+    return true;
+  } catch {
+    console.log('[ffmpeg] Not found, attempting runtime download...');
+    const ok = await downloadFFmpeg();
+    if (ok) {
+      // Clear cached paths
+      _ffmpeg = null;
+      _ffprobe = null;
+      try {
+        getFFmpeg();
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+}
+
 // ============================================
 // Video utilities
 // ============================================
@@ -64,8 +183,8 @@ function getYtDlpPath(): string {
  * Get video duration in seconds using ffprobe
  */
 export function getVideoDuration(filePath: string): number {
+  const ffprobe = getFFprobe();
   try {
-    const ffprobe = getFFprobe();
     const output = execSync(
       `"${ffprobe}" -v error -show_entries format=duration -of csv=p=0 "${filePath}"`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
@@ -76,7 +195,7 @@ export function getVideoDuration(filePath: string): number {
     return parseFloat(output);
   } catch (err: unknown) {
     if (err instanceof Error && err.message.includes('Could not read')) throw err;
-    throw new Error('Invalid video file. FFmpeg may not be available.');
+    throw new Error('Invalid video file. FFmpeg may not be available on this server.');
   }
 }
 
@@ -188,7 +307,6 @@ export async function downloadYouTubeVideo(
   );
 
   if (possibleFiles.length === 0) {
-    // Try any video file
     const anyFiles = fs.readdirSync(outputDir).filter(f =>
       /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
     );
@@ -233,14 +351,10 @@ export async function downloadYouTubeVideo(
  */
 export function extractAudio(videoPath: string, outputPath: string): void {
   const ffmpeg = getFFmpeg();
-  try {
-    execSync(
-      `"${ffmpeg}" -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${outputPath}"`,
-      { stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-  } catch {
-    throw new Error('Failed to extract audio from video.');
-  }
+  execSync(
+    `"${ffmpeg}" -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${outputPath}"`,
+    { stdio: ['pipe', 'pipe', 'pipe'] }
+  );
 }
 
 /**
@@ -279,14 +393,10 @@ export function splitAudio(inputPath: string, outputDir: string, maxChunkDuratio
  */
 export function cutVideo(inputPath: string, outputPath: string, startTime: number, endTime: number): void {
   const ffmpeg = getFFmpeg();
-  try {
-    execSync(
-      `"${ffmpeg}" -y -ss ${startTime} -i "${inputPath}" -t ${endTime - startTime} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
-      { stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-  } catch {
-    throw new Error(`Failed to cut segment (${startTime}s - ${endTime}s).`);
-  }
+  execSync(
+    `"${ffmpeg}" -y -ss ${startTime} -i "${inputPath}" -t ${endTime - startTime} -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`,
+    { stdio: ['pipe', 'pipe', 'pipe'] }
+  );
 }
 
 /**
