@@ -301,36 +301,87 @@ export async function downloadYouTubeVideo(
   catch { throw new Error('YouTube download is not available. Please upload a video file instead.'); }
 
   fs.mkdirSync(outputDir, { recursive: true });
+  console.log(`[yt-dlp] Binary: ${ytDlp}`);
   console.log(`[yt-dlp] Downloading: ${url}`);
 
   const outputPath = path.join(outputDir, 'yt_video.%(ext)s');
   let title = 'YouTube Video', duration = 0;
 
+  // Get video info
   try {
-    const info = await spawnYtDlp(['--no-download', '--print', '%(title)s', '--print', '%(duration)s', '--no-playlist', '--no-warnings', '--ignore-errors', url], 30000);
+    const info = await spawnYtDlp([
+      '--no-download', '--print', '%(title)s', '--print', '%(duration)s',
+      '--no-playlist', url,
+    ], 30000);
     const lines = info.stdout.trim().split('\n').filter(Boolean);
     if (lines.length >= 1) title = lines[0].trim();
     if (lines.length >= 2) duration = parseFloat(lines[1].trim()) || 0;
-  } catch {}
+    console.log(`[yt-dlp] Info: "${title}" ${duration}s`);
+    if (info.stderr) console.log(`[yt-dlp] Info stderr: ${info.stderr.slice(-300)}`);
+  } catch (err) {
+    console.warn('[yt-dlp] Info fetch failed:', err);
+  }
 
   if (duration > 600) throw new Error(`Video too long (${Math.floor(duration / 60)}min). Max 10 min.`);
 
-  const dl = await spawnYtDlp([
-    '-f', 'best[height<=720][ext=mp4]/best[height<=720][ext=webm]/best[height<=720]/best',
-    '--max-filesize', '200M', '-o', outputPath, '--no-playlist', '--newline', '--no-warnings', '--progress', '--ignore-errors', url,
-  ], 300000);
+  // Download — try multiple format strategies
+  const formatStrategies = [
+    // Strategy 1: best single file <=720p
+    { f: 'best[height<=720][ext=mp4]/best[height<=720]/best', label: 'best<=720p' },
+    // Strategy 2: any best single file
+    { f: 'best[ext=mp4]/best', label: 'best-any' },
+    // Strategy 3: worst quality (smallest, most likely to succeed)
+    { f: 'worst', label: 'worst' },
+  ];
 
-  const files = fs.readdirSync(outputDir).filter(f => f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f));
-  if (files.length === 0) {
-    const anyFiles = fs.readdirSync(outputDir).filter(f => /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f));
-    if (!anyFiles.length) throw new Error('Failed to download video.');
-    const p = path.join(outputDir, anyFiles[0]);
-    if (fs.statSync(p).size < 1000) { fs.unlinkSync(p); throw new Error('Downloaded file too small.'); }
-    return { videoPath: p, title, duration: getVideoDuration(p) };
+  let lastStderr = '';
+  let lastCode = -1;
+
+  for (const strategy of formatStrategies) {
+    console.log(`[yt-dlp] Trying format: ${strategy.f}`);
+
+    const dl = await spawnYtDlp([
+      '-f', strategy.f,
+      '--max-filesize', '200M',
+      '-o', outputPath,
+      '--no-playlist',
+      '--newline',
+      url,
+    ], 300000);
+
+    lastStderr = dl.stderr;
+    lastCode = dl.code;
+
+    console.log(`[yt-dlp] Exit code: ${dl.code}`);
+    if (dl.stderr) console.log(`[yt-dlp] stderr: ${dl.stderr.slice(-500)}`);
+
+    // Check if file was downloaded
+    const files = fs.readdirSync(outputDir).filter(f =>
+      f.startsWith('yt_video.') && /\.(mp4|webm|mkv|avi|mov|flv|3gp)$/i.test(f)
+    );
+
+    if (files.length > 0) {
+      const vp = path.join(outputDir, files[0]);
+      const fileSize = fs.statSync(vp).size;
+      if (fileSize > 1000) {
+        console.log(`[yt-dlp] Success: ${files[0]} (${(fileSize / 1024 / 1024).toFixed(1)}MB) format=${strategy.label}`);
+        return { videoPath: vp, title, duration: getVideoDuration(vp) };
+      }
+      // File too small, try next
+      fs.unlinkSync(vp);
+    }
   }
-  const vp = path.join(outputDir, files[0]);
-  if (fs.statSync(vp).size < 1000) { fs.unlinkSync(vp); throw new Error('Downloaded file too small.'); }
-  return { videoPath: vp, title, duration: getVideoDuration(vp) };
+
+  // All strategies failed — show detailed error
+  const stderrSummary = lastStderr.slice(-300).replace(/\n/g, ' ').trim();
+  console.error(`[yt-dlp] All strategies failed. Last stderr: ${stderrSummary}`);
+  console.error(`[yt-dlp] Dir contents:`, fs.readdirSync(outputDir));
+
+  throw new Error(
+    `Failed to download video. ` +
+    (lastCode !== 0 ? `Exit code ${lastCode}. ` : '') +
+    (stderrSummary ? `Reason: ${stderrSummary}` : 'The video may be private, age-restricted, or the URL may be invalid.')
+  );
 }
 
 export function extractAudio(videoPath: string, outputPath: string): void {
