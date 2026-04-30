@@ -52,3 +52,9 @@ prompt
 server.log
 # Skills directory
 /skills/
+# Runtime data
+/uploads/
+/outputs/
+/db/*.db
+/dev.log
+/keepalive.sh
