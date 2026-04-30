@@ -15,12 +15,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "ClipAI - AI Video Clipper & Subtitler",
-  description: "Upload your video and let AI create amazing clips with auto-generated subtitles. Powered by AI speech recognition and intelligent content analysis.",
-  keywords: ["ClipAI", "video clipper", "subtitle generator", "AI video editing", "speech to text"],
-  authors: [{ name: "Z.ai Team" }],
-  icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
-  },
+  description: "Upload your video or paste a YouTube link, and let AI create amazing clips with auto-generated subtitles.",
 };
 
 export default function RootLayout({
@@ -29,9 +24,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning className="dark">
+    <html lang="en" className="dark">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#0a0a0a] text-zinc-100`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#0a0a0a] text-zinc-100 min-h-screen`}
       >
         {children}
         <Toaster />
