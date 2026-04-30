@@ -58,6 +58,5 @@ server.log
 /db/*.db
 /dev.log
 /keepalive.sh
-bin/ffmpeg
-bin/ffprobe
-bin/yt-dlp
+# bin/ binaries are committed for deployment reliability
+# (ffmpeg, ffprobe, yt-dlp)

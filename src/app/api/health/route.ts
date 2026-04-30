@@ -36,7 +36,6 @@ export async function GET() {
   try {
     const ffmpegStart = Date.now();
 
-    // First check if already available
     let ffmpegPath = findBinary('ffmpeg');
     let ffprobePath = findBinary('ffprobe');
 
@@ -67,10 +66,19 @@ export async function GET() {
         details: `${ffmpegVer} | ${ffprobeVer}`,
       });
     } else {
+      // Read setup log for diagnostics
+      let setupLog = '';
+      const logPath = path.join(process.cwd(), 'bin', 'setup.log');
+      if (fs.existsSync(logPath)) {
+        try {
+          setupLog = fs.readFileSync(logPath, 'utf-8').slice(-500);
+        } catch {}
+      }
       results.push({
         service: 'FFmpeg',
         status: 'error',
         message: `FFmpeg not found — auto-download failed. Video processing unavailable.`,
+        details: setupLog ? `Setup log (last 500 chars): ${setupLog}` : 'No setup log found.',
       });
     }
   } catch {

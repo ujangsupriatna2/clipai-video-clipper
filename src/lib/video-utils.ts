@@ -7,104 +7,13 @@ import path from 'path';
 // ============================================
 
 let _downloading = false;
-
-/**
- * Download FFmpeg static binary at runtime (fallback if build-time download failed)
- */
-async function downloadFFmpeg(): Promise<boolean> {
-  if (_downloading) return false;
-  _downloading = true;
-
-  const binDir = path.join(process.cwd(), 'bin');
-  fs.mkdirSync(binDir, { recursive: true });
-
-  const sources = [
-    {
-      name: 'johnvansickle.com',
-      url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
-      extract: (tmpDir: string) => {
-        const dir = fs.readdirSync(tmpDir).find(f => f.includes('ffmpeg') && f.includes('static'));
-        if (!dir) return null;
-        const base = path.join(tmpDir, dir);
-        return {
-          ffmpeg: path.join(base, 'ffmpeg'),
-          ffprobe: path.join(base, 'ffprobe'),
-        };
-      },
-    },
-    {
-      name: 'BtbN GitHub',
-      url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz',
-      extract: (tmpDir: string) => {
-        const dir = fs.readdirSync(tmpDir).find(f => f.includes('linux64-gpl'));
-        if (!dir) return null;
-        const base = path.join(tmpDir, dir, 'bin');
-        return {
-          ffmpeg: path.join(base, 'ffmpeg'),
-          ffprobe: path.join(base, 'ffprobe'),
-        };
-      },
-    },
-  ];
-
-  for (const source of sources) {
-    try {
-      console.log(`[ffmpeg] Downloading from ${source.name}...`);
-      const tmpDir = fs.mkdtempSync('/tmp/ffmpeg-XXXXXX');
-      const archivePath = path.join(tmpDir, 'ffmpeg.tar.xz');
-
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn('curl', [
-          '-L', '--max-time', '300',
-          source.url, '-o', archivePath,
-        ], { stdio: ['pipe', 'pipe', 'pipe'] });
-
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`curl exit ${code}`));
-        });
-        proc.on('error', reject);
-      });
-
-      if (fs.statSync(archivePath).size < 1000000) {
-        console.warn(`[ffmpeg] Download too small from ${source.name}`);
-        fs.rmSync(tmpDir, { recursive: true });
-        continue;
-      }
-
-      // Extract
-      execSync(`tar xf "${archivePath}" -C "${tmpDir}"`, { timeout: 60000 });
-
-      const bins = source.extract(tmpDir);
-      if (!bins || !fs.existsSync(bins.ffmpeg)) {
-        console.warn(`[ffmpeg] Could not find binaries in archive from ${source.name}`);
-        fs.rmSync(tmpDir, { recursive: true });
-        continue;
-      }
-
-      fs.copyFileSync(bins.ffmpeg, path.join(binDir, 'ffmpeg'));
-      if (fs.existsSync(bins.ffprobe)) {
-        fs.copyFileSync(bins.ffprobe, path.join(binDir, 'ffprobe'));
-      }
-      fs.chmodSync(path.join(binDir, 'ffmpeg'), 0o755);
-      fs.chmodSync(path.join(binDir, 'ffprobe'), 0o755);
-
-      fs.rmSync(tmpDir, { recursive: true });
-      console.log(`[ffmpeg] Successfully installed from ${source.name}`);
-      _downloading = false;
-      return true;
-    } catch (err) {
-      console.warn(`[ffmpeg] Failed to download from ${source.name}:`, err);
-    }
-  }
-
-  _downloading = false;
-  return false;
-}
+let _ffmpeg: string | null = null;
+let _ffprobe: string | null = null;
+let _ytdlp: string | null = null;
 
 /**
  * Find a binary across multiple locations:
- * 1. Bundled in bin/ (for deployed env)
+ * 1. Bundled in bin/ (pre-committed or from build script)
  * 2. System PATH
  */
 function findBinary(name: string): string {
@@ -123,13 +32,8 @@ function findBinary(name: string): string {
     if (result) return result;
   } catch {}
 
-  throw new Error(`Required binary "${name}" not found. Video processing is unavailable.`);
+  throw new Error(`Required binary "${name}" not found.`);
 }
-
-// Resolve paths
-let _ffmpeg: string | null = null;
-let _ffprobe: string | null = null;
-let _ytdlp: string | null = null;
 
 function getFFmpeg(): string {
   if (!_ffmpeg) _ffmpeg = findBinary('ffmpeg');
@@ -153,6 +57,130 @@ function getYtDlpPath(): string {
 }
 
 /**
+ * Ensure xz extraction support is available
+ */
+async function ensureXzSupport(): Promise<boolean> {
+  try {
+    execSync('tar xJf - < /dev/null 2>/dev/null || (command -v xz > /dev/null)', { timeout: 3000, stdio: 'pipe' });
+    return true;
+  } catch {
+    // Try installing xz
+    try {
+      execSync('apt-get install -y -qq xz-utils 2>/dev/null || yum install -y xz 2>/dev/null || apk add xz 2>/dev/null', { timeout: 30000, stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * Download FFmpeg static binary at runtime (fallback if build-time failed)
+ */
+async function downloadFFmpeg(): Promise<boolean> {
+  if (_downloading) return false;
+  _downloading = true;
+
+  const binDir = path.join(process.cwd(), 'bin');
+  try { fs.mkdirSync(binDir, { recursive: true }); } catch {}
+
+  const sources = [
+    {
+      name: 'johnvansickle.com (~40MB)',
+      url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
+      minSize: 1000000, // 1MB
+      extract: (tmpDir: string, archivePath: string): string[] | null => {
+        const dir = fs.readdirSync(tmpDir).find(f => f.includes('ffmpeg') && f.includes('static'));
+        if (!dir) return null;
+        const base = path.join(tmpDir, dir);
+        return [path.join(base, 'ffmpeg'), path.join(base, 'ffprobe')];
+      },
+    },
+    {
+      name: 'BtbN GitHub (~134MB)',
+      url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz',
+      minSize: 10000000, // 10MB
+      extract: (tmpDir: string, archivePath: string): string[] | null => {
+        const dir = fs.readdirSync(tmpDir).find(f => f.includes('linux64-gpl'));
+        if (!dir) return null;
+        const base = path.join(tmpDir, dir, 'bin');
+        return [path.join(base, 'ffmpeg'), path.join(base, 'ffprobe')];
+      },
+    },
+  ];
+
+  await ensureXzSupport();
+
+  for (const source of sources) {
+    try {
+      console.log(`[ffmpeg] Downloading from ${source.name}...`);
+      const tmpDir = fs.mkdtempSync('/tmp/ffmpeg-XXXXXX');
+      const archivePath = path.join(tmpDir, 'ffmpeg.tar.xz');
+
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('curl', [
+          '-L', '--max-time', '600',
+          source.url, '-o', archivePath,
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`curl exit ${code}`));
+        });
+        proc.on('error', reject);
+      });
+
+      const fileSize = fs.statSync(archivePath).size;
+      if (fileSize < source.minSize) {
+        console.warn(`[ffmpeg] Download too small from ${source.name}: ${fileSize} bytes`);
+        fs.rmSync(tmpDir, { recursive: true });
+        continue;
+      }
+
+      console.log(`[ffmpeg] Downloaded ${Math.round(fileSize / 1024 / 1024)}MB, extracting...`);
+
+      // Try tar extraction first, then fallback to xz pipe
+      try {
+        execSync(`tar xf "${archivePath}" -C "${tmpDir}"`, { timeout: 60000 });
+      } catch {
+        console.warn(`[ffmpeg] tar xf failed, trying xz pipe...`);
+        try {
+          execSync(`xz -dc "${archivePath}" | tar xf - -C "${tmpDir}"`, { timeout: 60000 });
+        } catch (xzErr) {
+          console.warn(`[ffmpeg] xz extraction also failed:`, xzErr);
+          fs.rmSync(tmpDir, { recursive: true });
+          continue;
+        }
+      }
+
+      const binPaths = source.extract(tmpDir, archivePath);
+      if (!binPaths || !binPaths[0] || !fs.existsSync(binPaths[0])) {
+        console.warn(`[ffmpeg] Could not find binaries in archive from ${source.name}`);
+        fs.rmSync(tmpDir, { recursive: true });
+        continue;
+      }
+
+      fs.copyFileSync(binPaths[0], path.join(binDir, 'ffmpeg'));
+      if (binPaths[1] && fs.existsSync(binPaths[1])) {
+        fs.copyFileSync(binPaths[1], path.join(binDir, 'ffprobe'));
+      }
+      fs.chmodSync(path.join(binDir, 'ffmpeg'), 0o755);
+      fs.chmodSync(path.join(binDir, 'ffprobe'), 0o755);
+
+      fs.rmSync(tmpDir, { recursive: true });
+      console.log(`[ffmpeg] Successfully installed from ${source.name}`);
+      _downloading = false;
+      return true;
+    } catch (err) {
+      console.warn(`[ffmpeg] Failed from ${source.name}:`, err);
+    }
+  }
+
+  _downloading = false;
+  return false;
+}
+
+/**
  * Ensure FFmpeg is available. If not found, try downloading at runtime.
  */
 export async function ensureFFmpeg(): Promise<boolean> {
@@ -163,7 +191,6 @@ export async function ensureFFmpeg(): Promise<boolean> {
     console.log('[ffmpeg] Not found, attempting runtime download...');
     const ok = await downloadFFmpeg();
     if (ok) {
-      // Clear cached paths
       _ffmpeg = null;
       _ffprobe = null;
       try {
