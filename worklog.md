@@ -43,3 +43,30 @@ Stage Summary:
 - Health check endpoint available at /api/health
 - Footer shows live service status with expandable detail panel
 - Ready for deployment - user can click footer to verify services after deploy
+
+---
+Task ID: 7
+Agent: Main
+Task: Fix FFmpeg missing in deployed environment + fix YouTube download failure
+
+Work Log:
+- User deployed and health check showed FFmpeg NOT available (only error message, false positive due to pipe bug)
+- Root cause: deployed container has NO system FFmpeg, only yt-dlp was bundled
+- YouTube download also failed because yt-dlp format `bestvideo+bestaudio` needs FFmpeg to merge
+- Fixes applied:
+  1. **setup-ytdlp.sh** → Now downloads static FFmpeg binary from johnvansickle.com during build (~77MB)
+  2. **video-utils.ts** → Complete rewrite:
+     - `findBinary()` function checks bin/ first, then system PATH
+     - All functions use quoted binary paths: `"${ffmpeg}" -i ...`
+     - yt-dlp format changed to single-file: `best[height<=720][ext=mp4]/best[height<=720]/best` (no merge needed)
+     - Removed `--merge-output-format mp4` from yt-dlp args
+  3. **Health check** → Fixed pipe bug: replaced `ffmpeg -version 2>&1 | head -1` (hides exit code) with direct `"${path}" --version` call
+  4. **.gitignore** → Added bin/ffmpeg, bin/ffprobe, bin/yt-dlp (binaries downloaded during build, not committed)
+- Local test: all 5 services OK, health check properly detects bundled FFmpeg
+
+Stage Summary:
+- FFmpeg is now downloaded as static binary during build (no system dependency)
+- YouTube download uses single-file format (no FFmpeg merge needed for download step)
+- All binary paths properly resolved: bin/ first, then system PATH
+- Health check correctly reports FFmpeg status (no more false positive)
+- Build flow: setup-ytdlp.sh → downloads yt-dlp + ffmpeg to bin/ → next build → cp bin/ to standalone/
