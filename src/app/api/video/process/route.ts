@@ -9,6 +9,7 @@ import {
   cutVideo,
   generateSRT,
   burnSubtitles,
+  downloadYouTubeVideo,
 } from '@/lib/video-utils';
 
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
@@ -28,41 +29,90 @@ export async function POST(req: NextRequest) {
       let outputDir = '';
 
       try {
-        // Parse form data
-        const formData = await req.formData();
-        const videoFile = formData.get('video') as File | null;
+        // Determine input type: file upload or YouTube URL
+        const contentType = req.headers.get('content-type') || '';
+        let videoPath = '';
 
-        if (!videoFile) {
-          send({ step: 'error' as const, message: 'No video file provided', error: 'No video file uploaded.' });
-          controller.close();
-          return;
+        // Check if it's a JSON body with YouTube URL
+        if (contentType.includes('application/json')) {
+          const body = await req.json();
+          const youtubeUrl = body.youtubeUrl || body.url;
+
+          if (!youtubeUrl) {
+            send({ step: 'error' as const, message: 'No YouTube URL provided', error: 'Please provide a YouTube URL.' });
+            controller.close();
+            return;
+          }
+
+          jobId = randomUUID().replace(/-/g, '').slice(0, 12);
+          uploadDir = path.join(UPLOADS_DIR, jobId);
+          outputDir = path.join(OUTPUTS_DIR, jobId);
+          fs.mkdirSync(uploadDir, { recursive: true });
+          fs.mkdirSync(outputDir, { recursive: true });
+
+          send({
+            step: 'uploading',
+            message: 'Downloading YouTube video...',
+            progress: 5,
+            jobId,
+          });
+
+          // Download YouTube video
+          const ytResult = await downloadYouTubeVideo(
+            youtubeUrl,
+            uploadDir,
+            (percent) => {
+              send({
+                step: 'uploading',
+                message: `Downloading YouTube video... ${Math.round(percent)}%`,
+                progress: 5 + (percent / 100) * 15,
+              });
+            }
+          );
+
+          videoPath = ytResult.videoPath;
+
+          send({
+            step: 'uploading',
+            message: `Downloaded "${ytResult.title}" (${ytResult.duration.toFixed(1)}s). Extracting audio...`,
+            progress: 20,
+          });
+
+        } else {
+          // File upload
+          const formData = await req.formData();
+          const videoFile = formData.get('video') as File | null;
+
+          if (!videoFile) {
+            send({ step: 'error' as const, message: 'No video file provided', error: 'No video file uploaded.' });
+            controller.close();
+            return;
+          }
+
+          jobId = randomUUID().replace(/-/g, '').slice(0, 12);
+          uploadDir = path.join(UPLOADS_DIR, jobId);
+          outputDir = path.join(OUTPUTS_DIR, jobId);
+          fs.mkdirSync(uploadDir, { recursive: true });
+          fs.mkdirSync(outputDir, { recursive: true });
+
+          send({
+            step: 'uploading',
+            message: 'Saving uploaded video...',
+            progress: 10,
+            jobId,
+          });
+
+          videoPath = path.join(uploadDir, `original${path.extname(videoFile.name) || '.mp4'}`);
+          const videoBuffer = Buffer.from(await videoFile.arrayBuffer());
+          fs.writeFileSync(videoPath, videoBuffer);
         }
-
-        // Generate job ID and create directories
-        jobId = randomUUID().replace(/-/g, '').slice(0, 12);
-        uploadDir = path.join(UPLOADS_DIR, jobId);
-        outputDir = path.join(OUTPUTS_DIR, jobId);
-
-        fs.mkdirSync(uploadDir, { recursive: true });
-        fs.mkdirSync(outputDir, { recursive: true });
-
-        // Save uploaded video
-        send({
-          step: 'uploading',
-          message: 'Saving uploaded video...',
-          progress: 10,
-          jobId,
-        });
-
-        const videoPath = path.join(uploadDir, `original${path.extname(videoFile.name) || '.mp4'}`);
-        const videoBuffer = Buffer.from(await videoFile.arrayBuffer());
-        fs.writeFileSync(videoPath, videoBuffer);
 
         // Get video duration
         const videoDuration = getVideoDuration(videoPath);
+
         send({
           step: 'uploading',
-          message: `Video saved (${videoDuration.toFixed(1)}s). Extracting audio...`,
+          message: `Video ready (${videoDuration.toFixed(1)}s). Extracting audio...`,
           progress: 20,
         });
 
@@ -168,7 +218,7 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
 
         const llmContent = llmResponse.choices[0]?.message?.content || '';
 
-        // Parse the LLM response - try to extract JSON
+        // Parse the LLM response
         let segments: Array<{
           start_time: number;
           end_time: number;
@@ -178,18 +228,15 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
         }> = [];
 
         try {
-          // Try to parse directly
           const parsed = JSON.parse(llmContent);
           segments = parsed.segments || [];
         } catch {
-          // Try to extract JSON from markdown code block
           const jsonMatch = llmContent.match(/```(?:json)?\s*([\s\S]*?)```/);
           if (jsonMatch) {
             try {
               const parsed = JSON.parse(jsonMatch[1]);
               segments = parsed.segments || [];
             } catch {
-              // Last resort: try to find JSON object
               const objMatch = llmContent.match(/\{[\s\S]*"segments"[\s\S]*\}/);
               if (objMatch) {
                 try {
@@ -202,7 +249,6 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
         }
 
         if (segments.length === 0) {
-          // Fallback: create a single clip from the whole video
           segments = [{
             start_time: 0,
             end_time: Math.min(videoDuration, 60),
@@ -217,7 +263,7 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
           ...seg,
           start_time: Math.max(0, seg.start_time),
           end_time: Math.min(videoDuration, seg.end_time),
-        })).filter(seg => seg.end_time - seg.start_time >= 3); // At least 3 seconds
+        })).filter(seg => seg.end_time - seg.start_time >= 3);
 
         if (segments.length === 0) {
           send({
@@ -259,19 +305,15 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
 
           const clipDuration = seg.end_time - seg.start_time;
 
-          // Cut video segment
           const rawClipPath = path.join(outputDir, `clip-${i + 1}-raw.mp4`);
           cutVideo(videoPath, rawClipPath, seg.start_time, seg.end_time);
 
-          // Generate SRT subtitle
           const srtPath = path.join(outputDir, `clip-${i + 1}.srt`);
           generateSRT(seg.subtitle_text, clipDuration, srtPath);
 
-          // Burn subtitles into clip
           const finalClipPath = path.join(outputDir, `clip-${i + 1}.mp4`);
           burnSubtitles(rawClipPath, srtPath, finalClipPath);
 
-          // Clean up raw clip
           try { fs.unlinkSync(rawClipPath); } catch {}
 
           clips.push({
@@ -286,10 +328,9 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
           });
         }
 
-        // Clean up: remove upload directory to save space
+        // Clean up upload directory
         try { fs.rmSync(uploadDir, { recursive: true }); } catch {}
 
-        // Send final result
         send({
           step: 'done',
           message: `${clips.length} clips generated successfully!`,
@@ -310,7 +351,6 @@ If the video is very short (under 60 seconds), just return 1-2 segments covering
           error: errorMessage,
         });
 
-        // Clean up on error
         if (uploadDir && fs.existsSync(uploadDir)) {
           try { fs.rmSync(uploadDir, { recursive: true }); } catch {}
         }

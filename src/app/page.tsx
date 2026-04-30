@@ -18,6 +18,7 @@ export default function Home() {
   const [transcript, setTranscript] = useState('');
   const [jobId, setJobId] = useState('');
   const abortRef = useRef<AbortController | null>(null);
+  const latestClipsRef = useRef<ClipInfo[]>([]);
 
   const processVideo = useCallback(async (file: File) => {
     setPhase('processing');
@@ -25,6 +26,7 @@ export default function Home() {
     setStatusMessage('Uploading your video...');
     setProgress(5);
     setErrorMessage('');
+    latestClipsRef.current = [];
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -71,7 +73,10 @@ export default function Home() {
             setStatusMessage(data.message || '');
             if (data.progress !== undefined) setProgress(data.progress);
             if (data.transcript) setTranscript(data.transcript);
-            if (data.clips) setClips(data.clips);
+            if (data.clips) {
+              setClips(data.clips);
+              latestClipsRef.current = data.clips;
+            }
             if (data.jobId) setJobId(data.jobId);
           } catch (e) {
             if (e instanceof SyntaxError) continue;
@@ -80,14 +85,16 @@ export default function Home() {
         }
       }
 
-      // Check if we got clips
-      if (clips.length === 0 && buffer) {
-        // Try to parse remaining buffer
+      // Check remaining buffer
+      if (latestClipsRef.current.length === 0 && buffer) {
         const remaining = buffer.split('\n').filter(l => l.startsWith('data: '));
         for (const line of remaining) {
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.clips) setClips(data.clips);
+            if (data.clips) {
+              setClips(data.clips);
+              latestClipsRef.current = data.clips;
+            }
             if (data.jobId) setJobId(data.jobId);
           } catch {}
         }
@@ -97,7 +104,6 @@ export default function Home() {
       setStatusMessage('All done! Your clips are ready.');
       setProgress(100);
 
-      // Small delay before showing results
       setTimeout(() => {
         setPhase('done');
       }, 800);
@@ -111,7 +117,103 @@ export default function Home() {
       setCurrentStep('error');
       setPhase('error');
     }
-  }, [clips.length]);
+  }, []);
+
+  const processYouTubeUrl = useCallback(async (url: string) => {
+    setPhase('processing');
+    setCurrentStep('uploading');
+    setStatusMessage('Connecting to YouTube...');
+    setProgress(3);
+    setErrorMessage('');
+    latestClipsRef.current = [];
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const response = await fetch('/api/video/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ youtubeUrl: url }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Processing failed' }));
+        throw new Error(errorData.error || `Server error: ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response stream');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.step === 'error') {
+              throw new Error(data.error || 'Processing failed');
+            }
+
+            setCurrentStep(data.step);
+            setStatusMessage(data.message || '');
+            if (data.progress !== undefined) setProgress(data.progress);
+            if (data.transcript) setTranscript(data.transcript);
+            if (data.clips) {
+              setClips(data.clips);
+              latestClipsRef.current = data.clips;
+            }
+            if (data.jobId) setJobId(data.jobId);
+          } catch (e) {
+            if (e instanceof SyntaxError) continue;
+            throw e;
+          }
+        }
+      }
+
+      if (latestClipsRef.current.length === 0 && buffer) {
+        const remaining = buffer.split('\n').filter(l => l.startsWith('data: '));
+        for (const line of remaining) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.clips) {
+              setClips(data.clips);
+              latestClipsRef.current = data.clips;
+            }
+            if (data.jobId) setJobId(data.jobId);
+          } catch {}
+        }
+      }
+
+      setCurrentStep('done');
+      setStatusMessage('All done! Your clips are ready.');
+      setProgress(100);
+
+      setTimeout(() => {
+        setPhase('done');
+      }, 800);
+
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setErrorMessage('Processing was cancelled.');
+      } else {
+        setErrorMessage(err instanceof Error ? err.message : 'An unexpected error occurred.');
+      }
+      setCurrentStep('error');
+      setPhase('error');
+    }
+  }, []);
 
   const handleReset = useCallback(() => {
     if (abortRef.current) {
@@ -150,8 +252,8 @@ export default function Home() {
             </span>
           </h1>
           <p className="text-base sm:text-lg text-zinc-400 mt-3 leading-relaxed">
-            Upload your video, and let AI automatically find the best moments,
-            create clips, and add professional subtitles.
+            Paste a YouTube link or upload your video — AI finds the best moments,
+            creates clips, and adds professional subtitles.
           </p>
 
           {/* Feature badges */}
@@ -174,7 +276,10 @@ export default function Home() {
         {/* Dynamic Content Area */}
         <div className="flex-1 flex flex-col items-center justify-center w-full">
           {phase === 'idle' && (
-            <VideoUploadZone onFileSelect={processVideo} />
+            <VideoUploadZone
+              onFileSelect={processVideo}
+              onUrlSubmit={processYouTubeUrl}
+            />
           )}
 
           {phase === 'processing' && (

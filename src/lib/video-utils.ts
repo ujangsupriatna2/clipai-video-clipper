@@ -1,9 +1,12 @@
-import { execSync } from 'child_process';
+import { execSync, exec as execCb } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { promisify } from 'util';
 
+const execAsync = promisify(execCb);
 const FFMPEG = 'ffmpeg';
 const FFPROBE = 'ffprobe';
+const YT_DLP = '/home/z/.local/bin/yt-dlp';
 
 /**
  * Get video duration in seconds using ffprobe
@@ -15,7 +18,7 @@ export function getVideoDuration(filePath: string): number {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
     if (!output || isNaN(parseFloat(output))) {
-      throw new Error('Could not read video duration. The file may be corrupted or not a valid video.');
+      throw new Error('Could not read video duration.');
     }
     return parseFloat(output);
   } catch (err: unknown) {
@@ -37,13 +40,96 @@ export function getVideoInfo(filePath: string): {
     `${FFPROBE} -v error -select_streams v:0 -show_entries stream=width,height,codec_name,duration -of csv=p=0 "${filePath}"`,
     { encoding: 'utf-8' }
   ).trim();
-  const [width, height, codec, duration] = output.split(',');
+  const [width, height, codec] = output.split(',');
   const formatDuration = getVideoDuration(filePath);
   return {
     width: parseInt(width),
     height: parseInt(height),
     codec: codec || 'unknown',
     duration: formatDuration,
+  };
+}
+
+/**
+ * Download a YouTube video using yt-dlp
+ * Returns the path to the downloaded video file
+ */
+export async function downloadYouTubeVideo(
+  url: string,
+  outputDir: string,
+  onProgress?: (percent: number) => void
+): Promise<{ videoPath: string; title: string; duration: number }> {
+  const outputPath = path.join(outputDir, 'yt_video.mp4');
+
+  // First get video info (title, duration)
+  let title = 'YouTube Video';
+  let duration = 0;
+
+  try {
+    const infoCmd = `${YT_DLP} --print title --print duration --no-download "${url}"`;
+    const infoOutput = execSync(infoCmd, {
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim().split('\n');
+
+    if (infoOutput.length >= 1) title = infoOutput[0].trim();
+    if (infoOutput.length >= 2) duration = parseFloat(infoOutput[1].trim()) || 0;
+  } catch {
+    // Info fetch failed, continue with download
+  }
+
+  // Check duration limit (10 minutes)
+  if (duration > 600) {
+    throw new Error(`Video is too long (${Math.floor(duration / 60)} minutes). Maximum 10 minutes allowed.`);
+  }
+
+  // Download the video - best quality, mp4 format, max 720p for faster processing
+  const downloadCmd = [
+    YT_DLP,
+    '-f', 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+    '--merge-output-format', 'mp4',
+    '--max-filesize', '200M',
+    '-o', outputPath,
+    '--no-playlist',
+    '--newline',
+    '--progress',
+    url,
+  ].join(' ');
+
+  try {
+    execSync(downloadCmd, {
+      encoding: 'utf-8',
+      timeout: 300000, // 5 min timeout
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: 50 * 1024 * 1024,
+    });
+  } catch (err: unknown) {
+    // yt-dlp might still succeed even with stderr output
+    if (!fs.existsSync(outputPath)) {
+      throw new Error(
+        'Failed to download YouTube video. The video might be private, age-restricted, or unavailable in this region.'
+      );
+    }
+  }
+
+  // Verify the downloaded file exists and is valid
+  if (!fs.existsSync(outputPath)) {
+    throw new Error('Download completed but file not found. Please try again.');
+  }
+
+  const fileSize = fs.statSync(outputPath).size;
+  if (fileSize < 1000) {
+    fs.unlinkSync(outputPath);
+    throw new Error('Downloaded file is too small. The video might be unavailable.');
+  }
+
+  const actualDuration = getVideoDuration(outputPath);
+
+  return {
+    videoPath: outputPath,
+    title: title || 'YouTube Video',
+    duration: actualDuration,
   };
 }
 
@@ -86,14 +172,12 @@ export function cutVideo(
  * Distributes text evenly across the clip duration
  */
 export function generateSRT(subtitleText: string, duration: number, outputPath: string): void {
-  // Split text into sentences/lines
   const sentences = subtitleText
     .split(/(?<=[.!?])\s+|(?<=\n)/)
     .map(s => s.trim())
     .filter(s => s.length > 0);
 
   if (sentences.length === 0) {
-    // If no sentences found, just use the whole text
     sentences.push(subtitleText.trim());
   }
 
@@ -121,7 +205,6 @@ export function burnSubtitles(
   outputPath: string
 ): void {
   try {
-    // Escape colons and backslashes for FFmpeg subtitle filter
     const escapedSrtPath = srtPath.replace(/:/g, '\\:').replace(/\\/g, '\\\\');
 
     execSync(
@@ -151,7 +234,7 @@ export function generateThumbnail(
       { stdio: 'pipe' }
     );
   } catch {
-    // Thumbnail generation is non-critical, ignore errors
+    // Non-critical, ignore
   }
 }
 
